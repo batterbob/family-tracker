@@ -350,6 +350,8 @@ def admin_view(conn, d):
             "outdoor_target": targets["outdoor"],
             "daily_incomplete": [{"id": c["id"], "name": c["name"]}
                                  for c in assigned_daily if c["id"] not in done_ids],
+            "daily_complete": [{"id": c["id"], "name": c["name"]}
+                               for c in assigned_daily if c["id"] in done_ids],
         })
 
     # Chore list with per-chore assignment state for the table's assign toggles.
@@ -716,6 +718,21 @@ def admin_checklist_override():
             "completion_date, completed_at, parent_verified) VALUES (?,?,?,?,1)",
             (kid_id, chore_id, logic.d2s(d), logic.now_iso()))
         conn.commit()
+    return _admin_redirect()
+
+
+@app.route("/admin/chore/uncomplete", methods=["POST"])
+@require_admin
+def admin_chore_uncomplete():
+    """Remove today's completion record for a daily chore (parent override)."""
+    conn = get_db()
+    d = effective_today()
+    kid_id = request.form.get("kid_id")
+    chore_id = request.form.get("chore_id")
+    conn.execute(
+        "DELETE FROM chore_completions WHERE kid_id=? AND chore_id=? AND completion_date=?",
+        (kid_id, chore_id, logic.d2s(d)))
+    conn.commit()
     return _admin_redirect()
 
 

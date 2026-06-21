@@ -187,6 +187,15 @@
       {% for c in cards %}
         <div{% if loop.last %} class="overrides-right"{% endif %}>
           <h3 class="status-name">{{ c.name }}</h3>
+          {% for ch in c.daily_complete %}
+            <form method="post" action="/admin/chore/uncomplete" class="row-form">
+              {{ today_field() }}
+              <input type="hidden" name="kid_id" value="{{ c.id }}">
+              <input type="hidden" name="chore_id" value="{{ ch.id }}">
+              <span class="status-line status-good" style="flex:1">✓ {{ ch.name }}</span>
+              <button class="mini-btn danger">Undo</button>
+            </form>
+          {% endfor %}
           {% if c.daily_incomplete %}
             {% for ch in c.daily_incomplete %}
               <form method="post" action="/admin/checklist/override" class="row-form">
@@ -200,8 +209,8 @@
               {{ today_field() }}
               <button class="mini-btn primary">✓ Mark all done</button>
             </form>
-          {% else %}
-            <div class="status-line status-good">All daily chores done ✓</div>
+          {% elif not c.daily_complete %}
+            <div class="status-line status-muted">No daily chores assigned.</div>
           {% endif %}
         </div>
       {% endfor %}
