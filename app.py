@@ -115,10 +115,6 @@ def inject_globals():
     return {
         "app_name": g_set("app_name", "ChoreBoard"),
         "program_label": g_set("program_label", "Activity Tracker"),
-        "reading_label": g_set("reading_label", "Reading"),
-        "reading_enabled": g_set("reading_enabled", "1") != "0",
-        "outdoor_label": g_set("outdoor_label", "Outdoor Time"),
-        "outdoor_enabled": g_set("outdoor_enabled", "1") != "0",
         "nav_kids": [{"name": k["name"], "slug": k["url_slug"]}
                      for k in logic.active_kids(conn)],
     }
@@ -162,23 +158,36 @@ def _pct(value, target):
     return min(100, int(value / target * 100)) if target > 0 else 0
 
 
-def log_section(conn, kid, kind, d):
-    """View-model for a reading/outdoor log section, used by render + API."""
-    table = "reading_logs" if kind == "reading" else "outdoor_logs"
+def _quick_presets(unit):
+    return [15, 30, 45, 60] if unit == "minutes" else [1, 2, 3, 5]
+
+
+def activity_section(conn, kid, activity, d):
+    """View-model for one activity's log section, used by render + the log API.
+
+    Works for any activity and unit ('minutes' or 'count'). `kind` is the activity
+    key so the front end can post back to /api/log against the right activity.
+    """
     ws = logic.week_start(d)
     targets = logic.prorated_targets(conn, kid, ws)
-    target = targets["reading"] if kind == "reading" else targets["outdoor"]
-    weekly = (logic.weekly_reading if kind == "reading" else logic.weekly_outdoor)(
-        conn, kid["id"], ws)
-    today_total = logic.today_minutes(conn, table, kid["id"], d)
-    entries = [{"id": r["id"], "minutes": r["minutes"]}
-               for r in logic.today_entries(conn, table, kid["id"], d)]
+    target = targets["by_activity"].get(activity["id"], 0)
+    weekly = logic.weekly_activity_total(conn, activity["id"], kid["id"], ws)
+    today_total = logic.today_activity_total(conn, activity["id"], kid["id"], d)
+    entries = [{"id": r["id"], "amount": r["amount"]}
+               for r in logic.today_activity_entries(conn, activity["id"], kid["id"], d)]
 
     in_program = logic.in_program_window(conn, d) and not logic.is_paused(conn, d)
     pace_state, pace_needed = (logic.pace(conn, target, weekly, ws, d)
                                if in_program else ("inactive", None))
+    unit = activity["unit"]
     return {
-        "kind": kind,
+        "kind": activity["key"],
+        "activity_id": activity["id"],
+        "label": activity["label"],
+        "unit": unit,
+        "unit_label": "min" if unit == "minutes" else "",
+        "hm": unit == "minutes",
+        "quick": _quick_presets(unit),
         "weekly": weekly,
         "target": target,
         "today_total": today_total,
@@ -219,19 +228,27 @@ def kid_view(conn, kid, d):
     stars, streak = logic.scoreboard(conn, kid["id"])
     reward = logic.get_setting(conn, "scoreboard_reward_text", "") or ""
 
-    # Bonus history (last 5 finalized weeks)
+    # Activity log sections (one per enabled activity)
+    activity_sections = [activity_section(conn, kid, a, d)
+                         for a in logic.activities(conn, enabled_only=True)]
+
+    # Bonus history (last 5 finalized weeks), each with a per-activity breakdown.
     bonus_history = []
     for row in logic.kid_bonus_history(conn, kid["id"]):
         ws_h = logic.s2d(row["week_start_date"])
         we_h = logic.week_end(ws_h)
         label_h = ws_h.strftime("%b ") + str(ws_h.day) + "–" + str(we_h.day)
+        cols = []
+        for av in row["activities"]:
+            if av["unit"] == "minutes":
+                cell = "%s/%s" % (_fmt_hm(av["amount"]), _fmt_hm(av["target"]))
+            else:
+                cell = "%s/%s" % (av["amount"], av["target"])
+            cols.append({"label": av["label"], "cell": cell})
         bonus_history.append({
             "label": label_h,
             "earned": row["bonus_earned"] == 1,
-            "reading": row["reading_minutes"],
-            "reading_target": row["reading_target"],
-            "outdoor_hm": _fmt_hm(row["outdoor_minutes"]),
-            "outdoor_target_hm": _fmt_hm(row["outdoor_target"]),
+            "cols": cols,
         })
 
     # Allowance
@@ -270,8 +287,7 @@ def kid_view(conn, kid, d):
         "weekly": weekly,
         "scheduled": scheduled,
         "as_needed": as_needed,
-        "reading": log_section(conn, kid, "reading", d),
-        "outdoor": log_section(conn, kid, "outdoor", d),
+        "activity_sections": activity_sections,
         "stars": stars,
         "streak": streak,
         "reward": reward,
@@ -283,8 +299,6 @@ def kid_view(conn, kid, d):
         "points_enabled": points_enabled,
         "week_points": week_points,
         "points_dollars": points_dollars,
-        "reading_quick": [15, 25, 30, 60],
-        "outdoor_quick": [15, 30, 60, 90],
     }
 
 
@@ -296,11 +310,10 @@ def status_view(conn, d):
 
     ws = logic.week_start(d)
     in_program = logic.in_program_window(conn, d)
+    acts = logic.activities(conn, enabled_only=True)
     cards = []
     for kid in logic.active_kids(conn):
         targets = logic.prorated_targets(conn, kid, ws)
-        r = logic.weekly_reading(conn, kid["id"], ws)
-        o = logic.weekly_outdoor(conn, kid["id"], ws)
         done, completed_at = logic.checklist_status(conn, kid["id"], d)
         as_needed = [{"name": a["name"],
                       "done": a["completed_at"] is not None,
@@ -314,10 +327,7 @@ def status_view(conn, d):
             "completed_time": _fmt_time(completed_at),
             "as_needed": as_needed,
             "weekly": weekly_done,
-            "reading": {"weekly": r, "target": targets["reading"],
-                        "pct": _pct(r, targets["reading"])},
-            "outdoor": {"weekly_hm": _fmt_hm(o), "target_hm": _fmt_hm(targets["outdoor"]),
-                        "pct": _pct(o, targets["outdoor"])},
+            "activities": _kid_activity_progress(conn, kid, ws, acts, targets),
             "on_break": logic.is_paused(conn, d),
             "last_week_bonus": logic.last_week_bonus(conn, kid["id"], d),
         })
@@ -328,6 +338,23 @@ def status_view(conn, d):
     }
 
 
+def _kid_activity_progress(conn, kid, ws, acts, targets):
+    """Per-activity weekly progress dicts (display strings + percent) for a kid."""
+    out = []
+    for a in acts:
+        wk = logic.weekly_activity_total(conn, a["id"], kid["id"], ws)
+        tgt = targets["by_activity"].get(a["id"], 0)
+        minutes = a["unit"] == "minutes"
+        out.append({
+            "label": a["label"],
+            "weekly_disp": _fmt_hm(wk) if minutes else str(wk),
+            "target_disp": (_fmt_hm(tgt) if minutes else str(tgt)) + ("" if minutes else ""),
+            "unit_label": "min" if minutes else "",
+            "pct": _pct(wk, tgt),
+        })
+    return out
+
+
 def admin_view(conn, d):
     """Read-only dashboard data: today's status + this week's progress per kid."""
     logic.finalize_past_weeks(conn, d)
@@ -336,6 +363,7 @@ def admin_view(conn, d):
 
     ws = logic.week_start(d)
     points_enabled = logic.get_setting(conn, "points_enabled", "0") == "1"
+    acts = logic.activities(conn, enabled_only=True)
     cards = []
     for kid in logic.active_kids(conn):
         done, completed_at = logic.checklist_status(conn, kid["id"], d)
@@ -357,13 +385,10 @@ def admin_view(conn, d):
                           for a in logic.as_needed_for_kid(conn, kid["id"], d)],
             "checklist_days": comp_days,
             "checklist_elapsed": elapsed_days,
-            "reading": log_section(conn, kid, "reading", d),
-            "outdoor": log_section(conn, kid, "outdoor", d),
+            "activities": _kid_activity_progress(conn, kid, ws, acts, targets),
             "last_week_bonus": logic.last_week_bonus(conn, kid["id"], d),
             "prorated": targets["active_days"] < 7,
             "active_days": targets["active_days"],
-            "reading_target": targets["reading"],
-            "outdoor_target": targets["outdoor"],
             "daily_incomplete": [{"id": c["id"], "name": c["name"]}
                                  for c in assigned_daily if c["id"] not in done_ids],
             "daily_complete": [{"id": c["id"], "name": c["name"]}
@@ -419,33 +444,37 @@ def _valid_time(s):
 
 
 def _specials_with_paused(conn):
-    """Return special_periods rows enriched with paused_chore_ids (a set of ints)."""
+    """Return special_periods rows enriched with paused chore/activity id sets."""
     result = []
     for sp in logic.special_periods(conn):
-        rows = conn.execute(
+        chore_rows = conn.execute(
             "SELECT chore_id FROM special_period_paused_chores WHERE special_period_id=?",
             (sp["id"],)).fetchall()
-        result.append(dict(sp, paused_chore_ids={r["chore_id"] for r in rows}))
+        act_rows = conn.execute(
+            "SELECT activity_id FROM special_period_paused_activities "
+            "WHERE special_period_id=?", (sp["id"],)).fetchall()
+        result.append(dict(sp,
+                           paused_chore_ids={r["chore_id"] for r in chore_rows},
+                           paused_activity_ids={r["activity_id"] for r in act_rows}))
     return result
 
 
 def settings_view(conn):
-    kids = [{"id": k["id"], "name": k["name"], "slug": k["url_slug"],
-             "reading_target": k["reading_target_minutes"],
-             "outdoor_target": k["outdoor_target_minutes"],
-             "has_passphrase": bool(k["passphrase_hash"])}
-            for k in logic.active_kids(conn)]
+    acts = [dict(a) for a in logic.activities(conn, enabled_only=False)]
+    kids = []
+    for k in logic.active_kids(conn):
+        targets = {a["id"]: logic.activity_target(conn, a, k["id"]) for a in acts}
+        kids.append({"id": k["id"], "name": k["name"], "slug": k["url_slug"],
+                     "targets": targets, "has_passphrase": bool(k["passphrase_hash"])})
     all_kids = conn.execute("SELECT * FROM kids ORDER BY id").fetchall()
     g = lambda key, default="": logic.get_setting(conn, key, default)
     return {
         "kids": kids,
         "all_kids": [dict(k) for k in all_kids],
+        "activities": acts,
+        "any_activities_enabled": any(a["enabled"] for a in acts),
         "app_name_val": g("app_name", "ChoreBoard"),
         "program_label_val": g("program_label", "Activity Tracker"),
-        "reading_label_val": g("reading_label", "Reading"),
-        "reading_enabled_val": g("reading_enabled", "1") != "0",
-        "outdoor_label_val": g("outdoor_label", "Outdoor Time"),
-        "outdoor_enabled_val": g("outdoor_enabled", "1") != "0",
         "timezone_val": g("timezone", "America/New_York"),
         "reminder_time": g("reminder_time", "10:00"),
         "program_start": g("program_start_date", ""),
@@ -514,15 +543,24 @@ def history_view(conn, d):
                     "AND chore_id=? AND completion_date>=? AND completion_date<=?",
                     (kid["id"], ch["id"], logic.d2s(ws), logic.d2s(we))).fetchone()["n"]
                 breakdown.append({"name": ch["name"], "count": cnt})
+            act_cells = []
+            for ar in conn.execute(
+                    "SELECT wra.amount, wra.target, a.label, a.unit "
+                    "FROM weekly_result_activities wra JOIN activities a ON a.id = wra.activity_id "
+                    "WHERE wra.weekly_result_id=? ORDER BY a.sort_order, a.id",
+                    (res["id"],)).fetchall():
+                minutes = ar["unit"] == "minutes"
+                act_cells.append({
+                    "label": ar["label"],
+                    "weekly_disp": _fmt_hm(ar["amount"]) if minutes else str(ar["amount"]),
+                    "target_disp": _fmt_hm(ar["target"]) if minutes else str(ar["target"]),
+                    "met": ar["amount"] >= ar["target"],
+                })
             kcards.append({
                 "name": kid["name"],
                 "paused": res["is_paused_week"] == 1,
                 "bonus": res["bonus_earned"],
-                "reading": res["reading_minutes"], "reading_target": res["reading_target"],
-                "reading_met": res["reading_minutes"] >= res["reading_target"],
-                "outdoor_hm": _fmt_hm(res["outdoor_minutes"]),
-                "outdoor_target_hm": _fmt_hm(res["outdoor_target"]),
-                "outdoor_met": res["outdoor_minutes"] >= res["outdoor_target"],
+                "activities": act_cells,
                 "active_days": res["active_days"],
                 "checklist_days": comp, "checklist_active": active,
                 "breakdown": breakdown,
@@ -537,20 +575,22 @@ def history_view(conn, d):
 
 
 def logs_view(conn, d):
-    """Reading/outdoor entries for the current week, per kid, for admin editing."""
+    """Per-activity log entries for the current week, per kid, for admin editing."""
     ws = logic.week_start(d)
     we = logic.week_end(ws)
+    acts = logic.activities(conn, enabled_only=True)
     kids = []
     for kid in logic.active_kids(conn):
-        rows = {}
-        for kind, table in (("reading", "reading_logs"), ("outdoor", "outdoor_logs")):
-            rows[kind] = [dict(r) for r in conn.execute(
-                "SELECT id, log_date, minutes, source FROM %s "
-                "WHERE kid_id=? AND log_date >= ? AND log_date <= ? "
-                "ORDER BY log_date, id" % table,
-                (kid["id"], logic.d2s(ws), logic.d2s(we))).fetchall()]
-        kids.append({"name": kid["name"], "reading": rows["reading"],
-                     "outdoor": rows["outdoor"]})
+        sections = []
+        for a in acts:
+            entries = [dict(r) for r in conn.execute(
+                "SELECT id, log_date, amount, source FROM activity_logs "
+                "WHERE activity_id=? AND kid_id=? AND log_date >= ? AND log_date <= ? "
+                "ORDER BY log_date, id",
+                (a["id"], kid["id"], logic.d2s(ws), logic.d2s(we))).fetchall()]
+            sections.append({"key": a["key"], "label": a["label"],
+                             "unit": a["unit"], "entries": entries})
+        kids.append({"name": kid["name"], "sections": sections})
     debug = os.environ.get("CHORE_DEBUG", "0") in ("1", "true", "True")
     return {
         "week_label": "%s – %s" % (ws.strftime("%b ") + str(ws.day),
@@ -954,16 +994,66 @@ def admin_settings():
 @require_admin
 def admin_settings_targets():
     conn = get_db()
-    for k in logic.active_kids(conn):
-        try:
-            r = int(request.form.get("reading_%d" % k["id"]))
-            o = int(request.form.get("outdoor_%d" % k["id"]))
-        except (TypeError, ValueError):
-            continue
-        if r > 0 and o > 0:
-            conn.execute("UPDATE kids SET reading_target_minutes=?, "
-                         "outdoor_target_minutes=? WHERE id=?", (r, o, k["id"]))
+    kids = logic.active_kids(conn)
+    for a in logic.activities(conn, enabled_only=False):
+        for k in kids:
+            v = _int_or_none(request.form.get("target_%d_%d" % (a["id"], k["id"])))
+            if v is not None and v > 0:
+                logic.set_activity_target(conn, a["id"], k["id"], v)
     conn.commit()
+    return redirect("/admin/settings?saved=1")
+
+
+@app.route("/admin/settings/activity/add", methods=["POST"])
+@require_admin
+def admin_activity_add():
+    conn = get_db()
+    label = (request.form.get("label") or "").strip()
+    unit = request.form.get("unit") if request.form.get("unit") in ("minutes", "count") else "minutes"
+    if label:
+        base = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "activity"
+        key, i = base, 2
+        while conn.execute("SELECT 1 FROM activities WHERE key=?", (key,)).fetchone():
+            key = "%s_%d" % (base, i)
+            i += 1
+        nxt = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM activities").fetchone()["n"]
+        dt = max(0, _int_or_none(request.form.get("default_target")) or 0)
+        conn.execute(
+            "INSERT INTO activities (key, label, unit, enabled, sort_order, "
+            "supports_credit, default_target) VALUES (?,?,?,1,?,0,?)",
+            (key, label, unit, nxt, dt))
+        conn.commit()
+    return redirect("/admin/settings?saved=1")
+
+
+@app.route("/admin/settings/activity/update", methods=["POST"])
+@require_admin
+def admin_activity_update():
+    conn = get_db()
+    aid = _int_or_none(request.form.get("activity_id"))
+    label = (request.form.get("label") or "").strip()
+    unit = request.form.get("unit") if request.form.get("unit") in ("minutes", "count") else "minutes"
+    if aid and label:
+        conn.execute(
+            "UPDATE activities SET label=?, unit=?, enabled=?, default_target=? WHERE id=?",
+            (label, unit, 1 if request.form.get("enabled") else 0,
+             max(0, _int_or_none(request.form.get("default_target")) or 0), aid))
+        conn.commit()
+    return redirect("/admin/settings?saved=1")
+
+
+@app.route("/admin/settings/activity/delete", methods=["POST"])
+@require_admin
+def admin_activity_delete():
+    conn = get_db()
+    aid = _int_or_none(request.form.get("activity_id"))
+    if aid:
+        conn.execute("DELETE FROM activities WHERE id=?", (aid,))
+        conn.execute("DELETE FROM activity_targets WHERE activity_id=?", (aid,))
+        conn.execute("DELETE FROM activity_logs WHERE activity_id=?", (aid,))
+        conn.execute("DELETE FROM special_period_paused_activities WHERE activity_id=?", (aid,))
+        conn.commit()
     return redirect("/admin/settings?saved=1")
 
 
@@ -997,17 +1087,10 @@ def admin_settings_general():
 @require_admin
 def admin_settings_appconfig():
     conn = get_db()
-    for key, form_key in (("app_name", "app_name"), ("program_label", "program_label"),
-                          ("reading_label", "reading_label"),
-                          ("outdoor_label", "outdoor_label"),
-                          ("timezone", "timezone")):
-        val = (request.form.get(form_key) or "").strip()
+    for key in ("app_name", "program_label", "timezone"):
+        val = (request.form.get(key) or "").strip()
         if val:
             logic.set_setting(conn, key, val)
-    logic.set_setting(conn, "reading_enabled",
-                      "1" if request.form.get("reading_enabled") else "0")
-    logic.set_setting(conn, "outdoor_enabled",
-                      "1" if request.form.get("outdoor_enabled") else "0")
     conn.commit()
     return redirect("/admin/settings?saved=1")
 
@@ -1067,6 +1150,17 @@ def _save_paused_chores(conn, sp_id):
                 "(special_period_id, chore_id) VALUES (?,?)", (sp_id, cid_int))
 
 
+def _save_paused_activities(conn, sp_id):
+    """Replace the paused-activity list for a special period from form checkboxes."""
+    conn.execute("DELETE FROM special_period_paused_activities WHERE special_period_id=?", (sp_id,))
+    for aid in request.form.getlist("paused_activities"):
+        aid_int = _int_or_none(aid)
+        if aid_int:
+            conn.execute(
+                "INSERT OR IGNORE INTO special_period_paused_activities "
+                "(special_period_id, activity_id) VALUES (?,?)", (sp_id, aid_int))
+
+
 @app.route("/admin/special/add", methods=["POST"])
 @require_admin
 def admin_special_add():
@@ -1081,13 +1175,14 @@ def admin_special_add():
             omd = int(omd) if ptype == "outdoor_credit" else None
         except (TypeError, ValueError):
             omd = None
-        pause_reading = 1 if request.form.get("pause_reading") else 0
-        pause_outdoor = 1 if request.form.get("pause_outdoor") else 0
+        credit_aid = (_int_or_none(request.form.get("credit_activity_id"))
+                      if ptype == "outdoor_credit" else None)
         cur = conn.execute(
             "INSERT INTO special_periods (label, type, start_date, end_date, "
-            "outdoor_minutes_per_day, pause_reading, pause_outdoor) VALUES (?,?,?,?,?,?,?)",
-            (label, ptype, start, end, omd, pause_reading, pause_outdoor))
+            "outdoor_minutes_per_day, credit_activity_id) VALUES (?,?,?,?,?,?)",
+            (label, ptype, start, end, omd, credit_aid))
         _save_paused_chores(conn, cur.lastrowid)
+        _save_paused_activities(conn, cur.lastrowid)
         conn.commit()
     return redirect("/admin/settings?saved=1")
 
@@ -1107,13 +1202,14 @@ def admin_special_edit():
             omd = int(omd) if ptype == "outdoor_credit" else None
         except (TypeError, ValueError):
             omd = None
-        pause_reading = 1 if request.form.get("pause_reading") else 0
-        pause_outdoor = 1 if request.form.get("pause_outdoor") else 0
+        credit_aid = (_int_or_none(request.form.get("credit_activity_id"))
+                      if ptype == "outdoor_credit" else None)
         conn.execute(
             "UPDATE special_periods SET label=?, type=?, start_date=?, end_date=?, "
-            "outdoor_minutes_per_day=?, pause_reading=?, pause_outdoor=? WHERE id=?",
-            (label, ptype, start, end, omd, pause_reading, pause_outdoor, sp_id))
+            "outdoor_minutes_per_day=?, credit_activity_id=? WHERE id=?",
+            (label, ptype, start, end, omd, credit_aid, sp_id))
         _save_paused_chores(conn, sp_id)
+        _save_paused_activities(conn, sp_id)
         conn.commit()
     return redirect("/admin/settings?saved=1")
 
@@ -1124,6 +1220,7 @@ def admin_special_delete():
     conn = get_db()
     sp_id = request.form.get("id")
     conn.execute("DELETE FROM special_period_paused_chores WHERE special_period_id=?", (sp_id,))
+    conn.execute("DELETE FROM special_period_paused_activities WHERE special_period_id=?", (sp_id,))
     conn.execute("DELETE FROM special_periods WHERE id=?", (sp_id,))
     conn.commit()
     return redirect("/admin/settings?saved=1")
@@ -1154,17 +1251,13 @@ def _logs_redirect():
 @require_admin
 def admin_log_edit():
     conn = get_db()
-    kind = request.form.get("kind")
-    if kind not in ("reading", "outdoor"):
-        abort(400)
-    table = "reading_logs" if kind == "reading" else "outdoor_logs"
     try:
-        minutes = int(request.form.get("minutes"))
+        amount = int(request.form.get("minutes"))
     except (TypeError, ValueError):
-        minutes = 0
-    if minutes > 0:
-        conn.execute("UPDATE %s SET minutes=? WHERE id=? AND source='manual'" % table,
-                     (minutes, request.form.get("log_id")))
+        amount = 0
+    if amount > 0:
+        conn.execute("UPDATE activity_logs SET amount=? WHERE id=? AND source='manual'",
+                     (amount, request.form.get("log_id")))
         conn.commit()
     return _logs_redirect()
 
@@ -1173,11 +1266,7 @@ def admin_log_edit():
 @require_admin
 def admin_log_delete():
     conn = get_db()
-    kind = request.form.get("kind")
-    if kind not in ("reading", "outdoor"):
-        abort(400)
-    table = "reading_logs" if kind == "reading" else "outdoor_logs"
-    conn.execute("DELETE FROM %s WHERE id=? AND source='manual'" % table,
+    conn.execute("DELETE FROM activity_logs WHERE id=? AND source='manual'",
                  (request.form.get("log_id"),))
     conn.commit()
     return _logs_redirect()
@@ -1279,25 +1368,24 @@ def api_log_add():
     data = request.get_json(silent=True) or {}
     kid = _require_kid(conn, data)
     d = effective_today()
-    kind = data.get("kind")
-    if kind not in ("reading", "outdoor"):
+    activity = logic.activity_by_key(conn, data.get("kind") or "")
+    if activity is None or not activity["enabled"]:
         abort(400)
     try:
-        minutes = int(data.get("minutes"))
+        amount = int(data.get("minutes"))
     except (TypeError, ValueError):
         abort(400)
-    if minutes <= 0 or minutes > 600:
+    if amount <= 0 or amount > 600:
         abort(400)
 
-    table = "reading_logs" if kind == "reading" else "outdoor_logs"
     conn.execute(
-        "INSERT INTO %s (kid_id, log_date, minutes, source, logged_at) "
-        "VALUES (?,?,?, 'manual', ?)" % table,
-        (kid["id"], logic.d2s(d), minutes, logic.now_iso()))
+        "INSERT INTO activity_logs (activity_id, kid_id, log_date, amount, source, logged_at) "
+        "VALUES (?,?,?,?, 'manual', ?)",
+        (activity["id"], kid["id"], logic.d2s(d), amount, logic.now_iso()))
     conn.commit()
 
     reinstated = _maybe_reinstate_bonus(conn, kid, d)
-    section = log_section(conn, kid, kind, d)
+    section = activity_section(conn, kid, activity, d)
     section["bonus_reinstated"] = reinstated
     return jsonify(section)
 
@@ -1308,16 +1396,16 @@ def api_log_remove():
     data = request.get_json(silent=True) or {}
     kid = _require_kid(conn, data)
     d = effective_today()
-    kind = data.get("kind")
-    if kind not in ("reading", "outdoor"):
+    activity = logic.activity_by_key(conn, data.get("kind") or "")
+    if activity is None:
         abort(400)
-    table = "reading_logs" if kind == "reading" else "outdoor_logs"
-    # Same-day, manual entries only — kids can't delete camp auto-credit or history.
+    # Same-day, manual entries only — kids can't delete auto-credit or history.
     conn.execute(
-        "DELETE FROM %s WHERE id=? AND kid_id=? AND log_date=? AND source='manual'"
-        % table, (data.get("id"), kid["id"], logic.d2s(d)))
+        "DELETE FROM activity_logs WHERE id=? AND kid_id=? AND log_date=? "
+        "AND activity_id=? AND source='manual'",
+        (data.get("id"), kid["id"], logic.d2s(d), activity["id"]))
     conn.commit()
-    return jsonify(log_section(conn, kid, kind, d))
+    return jsonify(activity_section(conn, kid, activity, d))
 
 
 # ---- Kid management ---------------------------------------------------- #
@@ -1427,15 +1515,14 @@ def setup_wizard():
         logic.set_setting(conn, "timezone", tz)
         if password:
             logic.set_setting(conn, "admin_password_hash", db.hash_password(password))
-        # Activities: enable/label each, or turn off for a chores-only setup.
-        logic.set_setting(conn, "reading_enabled",
-                          "1" if request.form.get("reading_enabled") else "0")
-        logic.set_setting(conn, "reading_label",
-                          (request.form.get("reading_label") or "Reading").strip())
-        logic.set_setting(conn, "outdoor_enabled",
-                          "1" if request.form.get("outdoor_enabled") else "0")
-        logic.set_setting(conn, "outdoor_label",
-                          (request.form.get("outdoor_label") or "Outdoor Time").strip())
+        # Activities: enable/label the two seeded rows, or turn them off for a
+        # chores-only setup. More activities can be added later in Settings.
+        conn.execute("UPDATE activities SET label=?, enabled=? WHERE key='reading'",
+                     ((request.form.get("reading_label") or "Reading").strip(),
+                      1 if request.form.get("reading_enabled") else 0))
+        conn.execute("UPDATE activities SET label=?, enabled=? WHERE key='outdoor'",
+                     ((request.form.get("outdoor_label") or "Outdoor Time").strip(),
+                      1 if request.form.get("outdoor_enabled") else 0))
         logic.set_setting(conn, "scoreboard_reward_text",
                           (request.form.get("reward") or "").strip())
         # Add kids from form (up to 4)
@@ -1471,7 +1558,10 @@ def admin_export():
     tables = ["kids", "chores", "chore_completions", "as_needed_assignments",
               "weekly_assignments", "rotating_chore_assignments", "reading_logs",
               "outdoor_logs", "settings", "notifications_sent", "weekly_results",
-              "special_periods", "special_period_paused_chores", "makeup_owed"]
+              "special_periods", "special_period_paused_chores", "makeup_owed",
+              "activities", "activity_targets", "activity_logs",
+              "weekly_result_activities", "makeup_deficits",
+              "special_period_paused_activities"]
     data = {}
     for t in tables:
         try:
@@ -1503,7 +1593,10 @@ def admin_import():
     tables = ["kids", "chores", "chore_completions", "as_needed_assignments",
               "weekly_assignments", "rotating_chore_assignments", "reading_logs",
               "outdoor_logs", "settings", "notifications_sent", "weekly_results",
-              "special_periods", "special_period_paused_chores", "makeup_owed"]
+              "special_periods", "special_period_paused_chores", "makeup_owed",
+              "activities", "activity_targets", "activity_logs",
+              "weekly_result_activities", "makeup_deficits",
+              "special_period_paused_activities"]
     conn = get_db()
     try:
         conn.execute("PRAGMA foreign_keys=OFF")

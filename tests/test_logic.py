@@ -600,7 +600,7 @@ class Scheduler(unittest.TestCase):
 
     def test_summary_message_format(self):
         msg = scheduler.build_summary(self.conn, date(2026, 6, 28))
-        self.assertIn("Alex: Reading 0/175 min ✗, Outdoor 0/5 hr ✗", msg)
+        self.assertIn("Alex: Reading 0/2.9 hr ✗, Outdoor Time 0/5 hr ✗", msg)
         self.assertIn("Jordan:", msg)
 
     def test_heartbeat_noop_without_url(self):

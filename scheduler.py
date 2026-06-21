@@ -41,14 +41,20 @@ def _hr(mins):
 def build_summary(conn, d):
     """Sunday-summary message for the week ending on d."""
     ws = logic.week_start(d)
+    acts = logic.activities(conn, enabled_only=True)
     parts = []
     for kid in logic.active_kids(conn):
         targets = logic.prorated_targets(conn, kid, ws)
-        r = logic.weekly_reading(conn, kid["id"], ws)
-        o = logic.weekly_outdoor(conn, kid["id"], ws)
-        parts.append("%s: Reading %d/%d min %s, Outdoor %s/%s hr %s" % (
-            kid["name"], r, targets["reading"], "✓" if r >= targets["reading"] else "✗",
-            _hr(o), _hr(targets["outdoor"]), "✓" if o >= targets["outdoor"] else "✗"))
+        bits = []
+        for a in acts:
+            cur = logic.weekly_activity_total(conn, a["id"], kid["id"], ws)
+            tgt = targets["by_activity"].get(a["id"], 0)
+            mark = "✓" if cur >= tgt else "✗"
+            if a["unit"] == "minutes":
+                bits.append("%s %s/%s hr %s" % (a["label"], _hr(cur), _hr(tgt), mark))
+            else:
+                bits.append("%s %d/%d %s" % (a["label"], cur, tgt, mark))
+        parts.append("%s: %s" % (kid["name"], ", ".join(bits) if bits else "checklist only"))
     return " ".join(parts)
 
 
