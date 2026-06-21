@@ -25,7 +25,7 @@ _LOG_BUFFER = collections.deque(maxlen=500)
 class _RingHandler(logging.Handler):
     def emit(self, record):
         _LOG_BUFFER.append({
-            "ts": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "level": record.levelname,
             "name": record.name,
             "msg": self.format(record),
