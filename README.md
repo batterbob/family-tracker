@@ -4,6 +4,8 @@ A self-hosted web app for keeping kids on track during a structured program — 
 
 Plain Flask + SQLite + vanilla JS. Runs as a single Docker container. No build step, no database server to manage.
 
+MIT License.
+
 ---
 
 ## What it does
